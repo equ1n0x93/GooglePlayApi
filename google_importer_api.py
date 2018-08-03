@@ -78,7 +78,7 @@ class GooglePlayAPI(object):
     SDK_VERSION = 23
 
     def __init__(self, androidId, email, password, google_token=None, lang=None, debug=False, login=True,
-                 authSubToken=None, proxy=None):  # you must use a device-associated androidId value
+                 authSubToken=None, proxy=None):  # you must use a device-associated androidId value (Android GSF ID)
 
         self.preFetch = {}
         self.android_authentication_session = requests.Session()
