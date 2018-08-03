@@ -1,24 +1,27 @@
-#!/usr/bin/python
-
-import base64
-import gzip
-import pprint
-import StringIO
-
-import logging
 import requests
+import logging
+import sys
 import urllib2
 import urllib
 import json
 import zlib
+
 from cookielib import CookieJar
+import gpsoauth
 
 from google.protobuf import descriptor
 from google.protobuf.internal.containers import RepeatedCompositeFieldContainer
+from google.protobuf.pyext._message import RepeatedCompositeContainer
 from google.protobuf import text_format
 from google.protobuf.message import Message, DecodeError
 
 import googleplay_pb2 as googleplay_pb2
+
+logging.basicConfig(stream=sys.stdout,
+                    format='%(asctime)s | %(levelname)-8.8s | %(filename)s | %(process)d | %(message).10000s',
+                    datefmt='%Y/%m/%d %H:%M:%S',
+                    level=logging.DEBUG)
+logger = logging
 
 
 class TooManyRequests(Exception):
@@ -74,7 +77,8 @@ class GooglePlayAPI(object):
     GMS_CORE_VERSION = '11302438'
     SDK_VERSION = 23
 
-    def __init__(self, androidId, email, password, google_token=None, lang=None, debug=False, login=True, authSubToken=None):  # you must use a device-associated androidId value
+    def __init__(self, androidId, email, password, google_token=None, lang=None, debug=False, login=True,
+                 authSubToken=None, proxy=None):  # you must use a device-associated androidId value
 
         self.preFetch = {}
         self.android_authentication_session = requests.Session()
@@ -90,12 +94,14 @@ class GooglePlayAPI(object):
         self.debug = debug
         self.authSubToken = authSubToken
         self.google_token = google_token
+        self.proxy = {'http': proxy, 'https': proxy} if proxy else None
         if self.google_token:
-            logging.info('google token exists: {}'.format(self.google_token))
+            logger.info('google token exists: {}'.format(self.google_token))
         if self.authSubToken:
-            logging.info('auth sub token exists: {}'.format(self.authSubToken))
+            logger.info('auth sub token exists: {}'.format(self.authSubToken))
         if login:
-            self.login()
+            self.loginV2()
+            # self.login()
 
     def _get_embedded_token(self, txt):
         import json
@@ -113,7 +119,7 @@ class GooglePlayAPI(object):
         """Converts the (protobuf) result from an API call into a dict, for
         easier introspection."""
         iterable = False
-        if isinstance(protoObj, RepeatedCompositeFieldContainer):
+        if isinstance(protoObj, (RepeatedCompositeFieldContainer, RepeatedCompositeContainer)):
             iterable = True
         else:
             protoObj = [protoObj]
@@ -123,7 +129,9 @@ class GooglePlayAPI(object):
             msg = dict()
             for fielddesc, value in po.ListFields():
                 # print value, type(value), getattr(value, "__iter__", False)
-                if fielddesc.type == descriptor.FieldDescriptor.TYPE_GROUP or isinstance(value, RepeatedCompositeFieldContainer) or isinstance(value, Message):
+                if fielddesc.type == descriptor.FieldDescriptor.TYPE_GROUP or \
+                    isinstance(value, (RepeatedCompositeFieldContainer, RepeatedCompositeContainer)) or \
+                    isinstance(value, Message):
                     msg[fielddesc.name] = self.toDict(value)
                 else:
                     msg[fielddesc.name] = value
@@ -146,11 +154,42 @@ class GooglePlayAPI(object):
                 self.preFetch[p.url] = p.response
 
     def setAuthSubToken(self, authSubToken):
+        logging.info("Auth token set: '%s'" % authSubToken)
         self.authSubToken = authSubToken
 
         # put your auth token in config.py to avoid multiple login requests
         if self.debug:
             print "authSubToken: " + authSubToken
+
+    def loginV2(self, accountType=ACCOUNT_TYPE_HOSTED_OR_GOOGLE):
+        encryptedPassword = gpsoauth.google.signature(self.email, self.psw, gpsoauth.android_key_7_3_29)
+        params = {"Email": self.email, "EncryptedPasswd": encryptedPassword,
+                  "service": self.SERVICE,
+                  "accountType": accountType, "has_permission": "1",
+                  "source": "android", "android_id": self.androidId,
+                  "app": "com.android.vending", "sdk_version": "17",
+                  "add_account": "1"}
+        resp = requests.post(self.URL_LOGIN, params)
+        logging.info("Attempting login to google services")
+
+        if resp.status_code == 200:
+            logging.info("Login request status code - 200")
+            data = resp.content
+            data = data.split()
+            params = {}
+            for d in data:
+                k, v = d.decode().split("=", 1)
+                params[k.strip()] = v.strip()
+            if "Auth" in params:
+                self.setAuthSubToken(params["Auth"])
+            else:
+                raise LoginError("Auth token not found.")
+        else:
+            if resp.status_code in [401, 403]:
+                raise LoginError("Login request failed, status code: %d" % resp.status_code)
+            else:
+                data = resp.content
+                raise LoginError("Login failed: error %d <%s>" % (resp.status_code, data.rstrip(),))
 
     def login(self):
         if not self.google_token:
@@ -199,47 +238,61 @@ class GooglePlayAPI(object):
             else:
                 raise LoginError("Auth token not found.")
 
-    def executeRequestApi2(self, path, datapost=None, post_content_type="application/x-www-form-urlencoded; charset=UTF-8"):
-        if (datapost is None and path in self.preFetch):
+    def execute_request_raw(self, path, datapost=None, post_content_type=None):
+        post_content_type = post_content_type or "application/x-www-form-urlencoded; charset=UTF-8"
+
+        if datapost is None and path in self.preFetch:
             data = self.preFetch[path]
         else:
-            headers = { "Accept-Language": self.lang,
-                                    "Authorization": "GoogleLogin auth=%s" % self.authSubToken,
-                                    "X-DFE-Enabled-Experiments": "cl:billing.select_add_instrument_by_default",
-                                    "X-DFE-Unsupported-Experiments": "nocache:billing.use_charging_poller,market_emails,buyer_currency,prod_baseline,checkin.set_asset_paid_app_field,shekel_test,content_ratings,buyer_currency_in_app,nocache:encrypted_apk,recent_changes",
-                                    "X-DFE-Device-Id": self.androidId,
-                                    "X-DFE-Client-Id": "am-android-google",
-                                    #"X-DFE-Logging-Id": self.loggingId2, # Deprecated?
-                                    "User-Agent": "Android-Finsky/7.4.12.L-all%20%5B0%5D%20%5BPR%5D%20144479971(api=3,versionCode=80741200,sdk=23,hardware=qcom,product=WW_Phone,platformVersionRelease=6.0.1,isWideScreen=0)",
-                                    "X-DFE-SmallestScreenWidthDp": "320",
-                                    "X-DFE-Filter-Level": "3",
-                                    "Accept-Encoding": "",
-
-                                    "Host": "android.clients.google.com"}
+            headers = {
+                "Accept-Language": self.lang,
+                "Authorization": "GoogleLogin auth=%s" % self.authSubToken,
+                "X-DFE-Enabled-Experiments": "cl:billing.select_add_instrument_by_default",
+                "X-DFE-Unsupported-Experiments": "nocache:billing.use_charging_poller,market_emails,buyer_currency,prod_baseline,checkin.set_asset_paid_app_field,shekel_test,content_ratings,buyer_currency_in_app,nocache:encrypted_apk,recent_changes",
+                "X-DFE-Device-Id": self.androidId,
+                "X-DFE-Client-Id": "am-android-google",
+                #"X-DFE-Logging-Id": self.loggingId2, # Deprecated?,
+                "User-Agent": "Android-Finsky/7.4.12.L-all%20%5B0%5D%20%5BPR%5D%20144479971(api=3,versionCode=80741200,sdk=23,hardware=qcom,product=WW_Phone,platformVersionRelease=6.0.1,isWideScreen=0)",
+                "X-DFE-SmallestScreenWidthDp": "320",
+                "X-DFE-Filter-Level": "3",
+                "Accept-Encoding": "",
+                "Host": "android.clients.google.com"
+            }
 
             if datapost is not None:
                 headers["Content-Type"] = post_content_type
 
             url = "https://android.clients.google.com/fdfe/%s" % path
             if datapost is not None:
-                response = requests.post(url, data=datapost, headers=headers, verify=False)
+                response = requests.post(url,
+                                         data=datapost,
+                                         headers=headers,
+                                         verify=False,
+                                         proxies=self.proxy,
+                                         timeout=30)
+
             else:
-                response = requests.get(url, headers=headers, verify=False)
-            logging.info('headers are %s' % dict(response.headers))
+                response = requests.get(url,
+                                        headers=headers,
+                                        verify=False,
+                                        proxies=self.proxy,
+                                        timeout=30)
+
+            logger.info('headers are %s' % dict(response.headers))
             if response.status_code == 429:
                 raise TooManyRequests
 
             data = response.content
+            return data
 
-        '''
-        data = StringIO.StringIO(data)
-        gzipper = gzip.GzipFile(fileobj=data)
-        data = gzipper.read()
-        '''
+    def executeRequestApi2(self, path, datapost=None, post_content_type=None, raw_response=None):
+
+        data = raw_response or self.execute_request_raw(path=path,
+                                                        datapost=datapost,
+                                                        post_content_type=post_content_type)
+
         message = googleplay_pb2.ResponseWrapper.FromString(data)
         self._try_register_preFetch(message)
-        # Debug
-        #print text_format.MessageToString(message)
         return message
 
     #####################################
@@ -282,14 +335,17 @@ class GooglePlayAPI(object):
                 url += "w1024"
 
         if url:
-            resp = requests.get(url)
+            resp = requests.get(url, proxies=self.proxy, timeout=30)
             return resp.content
 
-    def details(self, packageName):
+    def details(self, packageName, get_raw=False):
         """Get app details from a package name.
         packageName is the app unique ID (usually starting with 'com.')."""
         path = "details?doc=%s" % requests.utils.quote(packageName)
-        message = self.executeRequestApi2(path)
+        raw_response = self.execute_request_raw(path)
+        message = self.executeRequestApi2(path, raw_response=raw_response)
+        if get_raw:
+            return message.payload.detailsResponse, raw_response
         return message.payload.detailsResponse
 
     def bulkDetails(self, packageNames):
@@ -374,7 +430,7 @@ class GooglePlayAPI(object):
                    "Accept-Encoding": "",
                   }
 
-        response = requests.get(url, headers=headers, cookies=cookies, verify=False)
+        response = requests.get(url, headers=headers, cookies=cookies, verify=False, proxy=self.proxy, timeout=30)
         return response.content
 
     def _init_post_data(self, azt):
@@ -471,8 +527,8 @@ class GooglePlayAPI(object):
         resp = self._google_signin_session.open(full_url, data=urllib.urlencode(data))
 
         if not resp.code == 200:
-            logging.error('failed with google login challenge, status code: {}'.format(resp.status_code))
-            logging.error(_get_resp_content(resp))
+            logger.error('failed with google login challenge, status code: {}'.format(resp.status_code))
+            logger.error(_get_resp_content(resp))
             raise LoginError('failed to pass google signin challenge, suspicious behavior may be detected')
 
         return json.loads(_get_resp_content(resp)[6:])
@@ -512,8 +568,8 @@ class GooglePlayAPI(object):
         resp = self._google_signin_session.open(full_url, data=urllib.urlencode(data))
 
         if not resp.code == 200:
-            logging.error('failed with google login challenge')
-            logging.error(_get_resp_content(resp))
+            logger.error('failed with google login challenge')
+            logger.error(_get_resp_content(resp))
             raise LoginError('failed to pass google signin speedbump, suspicious behavior may be detected')
 
         return _get_resp_content(resp)
@@ -525,18 +581,18 @@ class GooglePlayAPI(object):
                 return cookie.value
 
     def _get_google_signign(self):
-        logging.info('trying to get google token for user: {}'.format(self.email))
-        logging.debug('getting embedded info')
+        logger.info('trying to get google token for user: {}'.format(self.email))
+        logger.debug('getting embedded info')
         azt, freq_token = self._get_embedded_info()
-        logging.debug('sending lookup request')
+        logger.debug('sending lookup request')
         lookup_resp = self._lookup_request(azt, freq_token)
-        logging.debug('sending request challenge')
+        logger.debug('sending request challenge')
         self._challenge_request(lookup_resp, azt)
-        logging.debug('sending challenge consent')
+        logger.debug('sending challenge consent')
         self._challenge_consent(lookup_resp, azt)
 
     def _get_google_token(self):
-        logging.info('trying to get market token for user: {}'.format(self.email))
+        logger.info('trying to get market token for user: {}'.format(self.email))
         first_sigin_data = {
             'ACCESS_TOKEN': '1',
             'Email': self.email,
@@ -564,16 +620,16 @@ class GooglePlayAPI(object):
             resp = self._android_auth_session.open('https://android.clients.google.com/auth',
                                                    data=urllib.urlencode(first_sigin_data))
         except urllib2.HTTPError as e:
-            logging.error('{}'.format(e))
-            logging.error('login failed, oauth_token cookie: {}'.format(self._find_cookie(
+            logger.error('{}'.format(e))
+            logger.error('login failed, oauth_token cookie: {}'.format(self._find_cookie(
                 self._google_signin_cookiejar, 'oauth_token')))
             raise LoginError('google login failed')
 
         resp_text = _get_resp_content(resp)
         bad_format_lines = [line for line in resp_text.splitlines() if '=' not in line and line]
         if bad_format_lines:
-            logging.warning('bad format lines')
-            logging.info('response lines: {}'.format(resp_text.splitlines()))
+            logger.warning('bad format lines')
+            logger.info('response lines: {}'.format(resp_text.splitlines()))
         # if line is for us to ignore empty lines
         resp_dict = {line.split('=')[0]: line.split('=')[1] for line in resp_text.splitlines() if line}
         return resp_dict['Token']
@@ -615,8 +671,8 @@ class GooglePlayAPI(object):
             return resp_dict['Auth']
 
         except urllib2.HTTPError as e:
-            logging.error('{}'.format(e), exc_info=True)
-            logging.error('google token probably expired, please try to regain token')
+            logger.error('{}'.format(e), exc_info=True)
+            logger.error('google token probably expired, please try to regain token')
             raise GoogleTokenExpired('token is expired')
 
 
